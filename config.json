@@ -1,0 +1,81 @@
+{
+  "_doc": "attack-stories (P11/P12). See README.md.",
+  "window_hours": 24,
+  "min_level": 5,
+  "min_events": 2,
+  "single_event_level": 10,
+  "max_timeline": 40,
+  "max_stories_in_report": 12,
+  "engine_dir": "/home/agent/agents/anomaly-engine",
+  "include_learn_findings": true,
+  "llm_report": "/home/agent/agents/bin/llm-report",
+  "key_tactics": [
+    "Credential Access",
+    "Lateral Movement",
+    "Exfiltration",
+    "Impact",
+    "Defense Evasion",
+    "Command and Control"
+  ],
+  "_hub_doc": "Entities every event shares; they never join events into one story. Hosts compare case-insensitively without the domain.",
+  "hub_entities": [
+    "DC01",
+    "DC02",
+    "siem",
+    "fw-edge",
+    "anomaly-engine",
+    "claude_agents",
+    "proxmox",
+    "pibox",
+    "SYSTEM",
+    "ANONYMOUS LOGON",
+    "LOCAL SERVICE",
+    "NETWORK SERVICE",
+    "-",
+    "192.168.5.1",
+    "192.168.99.1",
+    "0.0.0.0",
+    "::"
+  ],
+  "ignore_test_hosts": [
+    "P6-TEST"
+  ],
+  "ignore_test_users": [
+    "p4test",
+    "p6test"
+  ],
+  "_suppress_doc": "Known false positives dropped before grouping. Keys in an entry must all match: rule, desc_regex, ip_regex.",
+  "suppress": [
+    {
+      "desc_regex": "from Public IP",
+      "ip_regex": "^2001:db8:4a00:1f[89a-f][0-9a-f]:",
+      "_why": "Sigma public-IP logon rules fired on the LAN's own GUAs before sigma2wazuh local_filters went in (v7, 2026-11-24 06:13 UTC)"
+    }
+  ],
+  "_overrides_doc": "Per-rule level/technique overrides for scoring only. Wazuh tags 87702 (pfSense block burst) T1110, which turns every blocked burst into Credential Access.",
+  "rule_overrides": {
+    "87702": {
+      "level": 6,
+      "techniques": [
+        "T1046"
+      ]
+    }
+  },
+  "_blocked_doc": "Events that show a failed attempt. A story made only of them is capped at medium (all_blocked).",
+  "blocked_status": [
+    "400",
+    "401",
+    "403",
+    "404",
+    "405",
+    "444",
+    "499"
+  ],
+  "blocked_rules": [
+    "87701",
+    "87702"
+  ],
+  "blocked_detectors": [
+    "dmz_firewall_block"
+  ]
+}
