@@ -25,7 +25,7 @@ if [ -n "$url" ]; then
     if [ "$rc" -ne 0 ]; then status=down; msg="stories.py exit $rc"; fi
     if [ -f last_status.json ] && [ "$(python3 -c 'import json;print(json.load(open("last_status.json"))["alert"])')" = "True" ]; then
         status=down
-        msg=$(python3 -c 'import json,urllib.parse;d=json.load(open("last_status.json"));print(urllib.parse.quote(("["+d["worst"]+"] "+d["verdict"])[:180]))')
+        msg=$(python3 -c 'import json,urllib.parse;d=json.load(open("last_status.json"));sp=d.get("events_span","");ids=",".join(d.get("ids",[]));print(urllib.parse.quote(("["+d["worst"]+"] "+(sp+" " if sp else "")+(ids+": " if ids else "")+d["verdict"])[:220]))')
     fi
     curl -fsS -m 10 -o /dev/null "${url}?status=${status}&msg=${msg}" || true
 fi

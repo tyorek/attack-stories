@@ -22,9 +22,14 @@ Hourly (`17 * * * *` in the agent crontab) `run.sh` runs `stories.py`, which:
 5. Writes `stories.jsonl` (all current stories) and `attack.json` (stories plus a 7-day hourly series, for the
    dashboard). When a story is new or has grown, writes an evidence file and calls `llm-report`: low/medium stories
    use the local model only (`LLM_MODE=local`); a high or critical story goes through the normal local-then-Claude
-   path (P12 Claude audit). The report lands in `reports/stories-YYYYMMDD-HHMM.md`; `state.json` remembers each story's
-   event count, max level and tactics: a story is re-reported only when it gets worse (higher max level or a new
-   tactic), not when more events of the same kind join it (since 2026-11-24).
+   path (P12 Claude audit). The report lands in `reports/stories-YYYYMMDD-HHMM.md`; `state.json` keeps a fingerprint
+   of every event already judged (`wazuh:<doc id>` or `engine:<line hash>`, pruned after `seen_days`, default 8) and
+   the story id it was judged under. A story is reported only when it holds events never judged before and those
+   events make it worse (higher max level or a new tactic). Regrouped old events keep their earlier story id and never
+   re-alert, and more events of the same kind only update the state (since 2026-11-26; before that, escalation was
+   keyed on story ids, and an id change when older events joined a group re-paged an already-alerted story).
+   Each story carries `new_events`, `new_span` and `span`, timeline entries carry `new`, and the Kuma message leads
+   with the time range of the new events and the story ids.
 6. `last_status.json`: `alert` is true when the worst new story is high/critical and the verdict is not
    "Nothing actionable".
 

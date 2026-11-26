@@ -310,6 +310,24 @@ def alert_groups(events, stories, limit=60):
     return out[:limit]
 
 
+def parse_ts(ts):
+    try:
+        return dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def span_text(tss):
+    """'Nov 24 04:25-11:58 CST' for a set of event timestamps (display only)."""
+    ts = sorted(t.astimezone(TZ) for t in map(parse_ts, tss) if t)
+    if not ts:
+        return ""
+    a, b = ts[0], ts[-1]
+    if a.date() == b.date():
+        return f"{a:%b %d %H:%M}-{b:%H:%M} CST" if a != b else f"{a:%b %d %H:%M} CST"
+    return f"{a:%b %d %H:%M} - {b:%b %d %H:%M} CST"
+
+
 def story_id(evs):
     first = min(evs, key=lambda e: e["ts"])
     ents = sorted({x for e in evs for x in e["entities"]})
@@ -365,16 +383,30 @@ def main():
     a = ap.parse_args()
     e = env()
     events = indexer_alerts(e, a.hours) + engine_findings(a.hours)
-    stories = []
+    state_p = os.path.join(HERE, "state.json")
+    state = json.load(open(state_p)) if os.path.exists(state_p) else {}
+    # Event fingerprints (wazuh:<doc id>, engine:<line hash>) already judged in an earlier run, with the event time and
+    # the story id they were judged under. Escalation is decided on these, not on story ids: a story's id changes when
+    # older events join its group, and on 2026-11-25 that re-paged an already-alerted set of config changes (b3f705dcee).
+    first_run = "_seen" not in state
+    seen = state.get("_seen", {})
+    stories, groups, used = [], {}, set()
     for evs in group(events):
         evs.sort(key=lambda x: x["ts"])
         sev, tactics, max_level = score(evs)
         if len(evs) < CFG["min_events"] and max_level < CFG["single_event_level"]:
             continue
         ents = collections.Counter(x for ev in evs for x in ev["entities"])
+        # stable id: keep the id these events were judged under before, if any
+        prior = collections.Counter(seen[ev["id"]][1] for ev in evs if ev["id"] in seen)
+        sid = next((i for i, _ in prior.most_common() if i not in used), None) or story_id(evs)
+        used.add(sid)
+        groups[sid] = evs
+        fresh = [ev for ev in evs if ev["id"] not in seen]
         stories.append({
-            "id": story_id(evs), "severity": sev, "tactics": tactics, "max_level": max_level,
+            "id": sid, "severity": sev, "tactics": tactics, "max_level": max_level,
             "first": evs[0]["ts"], "last": evs[-1]["ts"], "events": len(evs),
+            "new_events": len(fresh), "new_span": span_text(ev["ts"] for ev in fresh), "span": span_text(ev["ts"] for ev in evs),
             "entities": [x for x, _ in ents.most_common(8)],
             "techniques": sorted({t for ev in evs for t in ev["techniques"]}),
             "sources": sorted({ev["src"] for ev in evs}),
@@ -383,26 +415,50 @@ def main():
             "tech_detail": tech_detail(evs),
             "timeline": [{"ts": ev["ts"], "src": ev["src"], "rule": ev["rule"], "level": ev["level"],
                           "desc": ev["desc"][:200], "techniques": ev["techniques"], "entities": ev["entities"][:4],
-                          "outcome": ev.get("outcome", "")}
+                          "outcome": ev.get("outcome", ""), "new": ev["id"] not in seen}
                          for ev in evs[-CFG["max_timeline"]:]],
         })
     stories.sort(key=lambda s: (-SEV_RANK[s["severity"]], -s["max_level"], s["first"]))
-    state_p = os.path.join(HERE, "state.json")
-    state = json.load(open(state_p)) if os.path.exists(state_p) else {}
     def escalated(s):
-        """Report a story when it is new, or when it got worse: a higher max level or a tactic it didn't have.
-        More events of the same kind (e.g. more of the admin's own config changes) only update the state."""
-        old = state.get(s["id"])
-        if old is None:
+        """Report a story only when it holds events never judged before AND it is new or got worse because of them:
+        a higher max level or a tactic the already-judged events didn't have. A regrouping of old events (new story
+        id, nothing new) never reports; more events of the same kind (e.g. more of the admin's own config changes) only
+        update the state."""
+        if first_run:  # migration from the per-story state (before 2026-11-26)
+            old = state.get(s["id"])
+            if old is None:
+                return True
+            if isinstance(old, int):
+                return old < s["events"]
+            return s["max_level"] > old.get("max_level", 0) or not set(s["tactics"]) <= set(old.get("tactics", []))
+        evs = groups[s["id"]]
+        if not any(ev["id"] not in seen for ev in evs):
+            return False
+        known = [ev for ev in evs if ev["id"] in seen]
+        if not known:
             return True
-        if isinstance(old, int):  # state from before 2026-11-24: event counts only
-            return old < s["events"]
-        return s["max_level"] > old.get("max_level", 0) or not set(s["tactics"]) <= set(old.get("tactics", []))
+        _, k_tactics, k_level = score(known)
+        return s["max_level"] > k_level or not set(s["tactics"]) <= set(k_tactics)
+
+    def save_state():
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=CFG.get("seen_days", 8))
+        for sid, evs in groups.items():
+            for ev in evs:
+                seen[ev["id"]] = [ev["ts"], sid]
+        kept = {k: v for k, v in seen.items() if (parse_ts(v[0]) or cutoff) >= cutoff}
+        out = {s["id"]: {"events": s["events"], "max_level": s["max_level"], "tactics": s["tactics"]} for s in stories}
+        out["_seen"] = kept
+        tmp = state_p + ".tmp"
+        json.dump(out, open(tmp, "w"), separators=(",", ":"))
+        os.replace(tmp, state_p)
     new = [s for s in stories if escalated(s)]
+    new_span = (span_text(ev["ts"] for s in new for ev in groups[s["id"]] if ev["id"] not in seen)
+                or span_text(ev["ts"] for s in new for ev in groups[s["id"]]))
     now = dt.datetime.now(TZ)
     if a.dry_run:
-        print(json.dumps({"events": len(events), "stories": len(stories), "new_or_grown": len(new),
-                          "top": [{k: s[k] for k in ("id", "severity", "tactics", "events", "entities", "max_level")} for s in stories[:10]]},
+        print(json.dumps({"events": len(events), "stories": len(stories), "new_or_grown": len(new), "seen_fingerprints": len(seen),
+                          "first_run": first_run, "would_report": [s["id"] for s in new],
+                          "top": [{k: s[k] for k in ("id", "severity", "tactics", "events", "new_events", "span", "entities", "max_level")} for s in stories[:10]]},
                          indent=1))
         return
     # every current story, for the dashboard and the digest
@@ -413,8 +469,7 @@ def main():
     os.makedirs(os.path.join(HERE, "reports"), exist_ok=True)
     if not new:
         print(f"{now.isoformat(timespec='seconds')} events={len(events)} stories={len(stories)} new=0 (no report)")
-        json.dump({s["id"]: {"events": s["events"], "max_level": s["max_level"], "tactics": s["tactics"]}
-               for s in stories}, open(state_p, "w"))
+        save_state()
         return
     worst = max(SEV_RANK[s["severity"]] for s in new)
     evidence = {"generated": now.isoformat(timespec="seconds"), "window_hours": a.hours,
@@ -436,13 +491,14 @@ def main():
             f.write("# Attacker stories: raw evidence (no model report)\n\nNeeds attention: the report model failed; raw evidence below.\n\n```json\n"
                     + json.dumps(evidence, indent=1)[:60000] + "\n```\n")
     verdict = next((l.strip() for l in open(report, errors="replace") if l.strip() and not l.startswith("#")), "")
-    json.dump({s["id"]: {"events": s["events"], "max_level": s["max_level"], "tactics": s["tactics"]}
-               for s in stories}, open(state_p, "w"))
+    save_state()
     # P12: high/critical + flagged -> Discord through the Kuma push monitor (run.sh reads this file)
     alert = worst >= SEV_RANK["high"] and not verdict.lower().startswith("nothing actionable")
     with open(os.path.join(HERE, "last_status.json"), "w") as f:
         json.dump({"time": now.isoformat(timespec="seconds"), "alert": alert, "verdict": verdict[:300], "report": report,
-                   "worst": [k for k, v in SEV_RANK.items() if v == worst][0], "new": len(new), "stories": len(stories)}, f)
+                   "worst": [k for k, v in SEV_RANK.items() if v == worst][0], "new": len(new), "stories": len(stories),
+                   "ids": [s["id"] for s in new][:3],
+                   "events_span": new_span}, f)
     print(f"{now.isoformat(timespec='seconds')} events={len(events)} stories={len(stories)} new={len(new)} worst={[k for k, v in SEV_RANK.items() if v == worst][0]} alert={alert} report={report}", flush=True)
 
 
